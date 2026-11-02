@@ -6,6 +6,7 @@ import io.dapr.workflows.runtime.WorkflowRuntime;
 import io.dapr.workflows.WorkflowActivity;
 import com.temporal.local.temporal_adv.dapr.workflows.EmiWorkflow;
 import com.temporal.local.temporal_adv.dapr.workflows.ForeclosureWorkflow;
+import com.temporal.local.temporal_adv.dapr.workflows.LoanEmiWorkflow;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import jakarta.annotation.PostConstruct;
@@ -31,6 +32,7 @@ public class DaprConfig {
 
         // Register workflows
         builder.registerWorkflow(EmiWorkflow.class);
+        builder.registerWorkflow(LoanEmiWorkflow.class);
         builder.registerWorkflow(ForeclosureWorkflow.class);
 
         // Register all spring-managed activities
@@ -42,4 +44,3 @@ public class DaprConfig {
         runtime.start(false); // start in background
     }
 }
-
