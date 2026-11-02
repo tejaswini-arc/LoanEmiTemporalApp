@@ -7,8 +7,8 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
-import com.temporal.local.temporal_adv.dapr.workflows.EmiWorkflow;
-import com.temporal.local.temporal_adv.dapr.dto.EmiCollectRequest;
+import com.temporal.local.temporal_adv.dapr.dto.LoanEmiRequest;
+import com.temporal.local.temporal_adv.dapr.workflows.LoanEmiWorkflow;
 
 import io.dapr.workflows.client.DaprWorkflowClient;
 import io.dapr.workflows.client.WorkflowState;
@@ -24,14 +24,16 @@ public class EmiController {
     }
 
     @PostMapping("/emi")
-    public String collect(@RequestParam String loanId, @RequestParam String customerId, @RequestParam long amount) {
-        String instanceId = "emi-" + UUID.randomUUID().toString();
-        EmiCollectRequest request = new EmiCollectRequest(loanId, customerId, amount);
+    public String collect(
+            @RequestParam String loanId,
+            @RequestParam String customerId,
+            @RequestParam long amount,
+            @RequestParam(defaultValue = "3") int installments) {
+        String instanceId = "loan-" + UUID.randomUUID();
+        LoanEmiRequest request = new LoanEmiRequest(loanId, customerId, amount, installments);
         try {
-            client.scheduleNewWorkflow(EmiWorkflow.class, request, instanceId);
+            client.scheduleNewWorkflow(LoanEmiWorkflow.class, request, instanceId);
 
-            // Note: Wait logic will differ from Temporal's synchronous stub invocation.
-            // Dapr orchestrates asynchronously. We can wait for completion using:
             WorkflowState state = client.waitForWorkflowCompletion(instanceId, Duration.ofSeconds(60), true);
             if (state != null && state.getRuntimeStatus().name().equals("COMPLETED")) {
                 return state.readOutputAs(String.class);
@@ -46,4 +48,3 @@ public class EmiController {
         }
     }
 }
-
