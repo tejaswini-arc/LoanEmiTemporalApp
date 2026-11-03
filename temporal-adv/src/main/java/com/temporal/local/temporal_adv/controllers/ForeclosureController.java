@@ -1,17 +1,17 @@
 package com.temporal.local.temporal_adv.controllers;
 
-import com.temporal.local.temporal_adv.interfaces.ForeclosureWorkflow;
+import com.temporal.local.temporal_adv.dapr.workflows.ForeclosureWorkflow;
 import com.temporal.local.temporal_adv.models.*;
 import com.temporal.local.temporal_adv.services.PendingApprovalStore;
-import io.temporal.client.ActivityCompletionClient;
-import io.temporal.client.WorkflowClient;
-import io.temporal.client.WorkflowOptions;
-import io.temporal.client.WorkflowStub;
+
+import io.dapr.workflows.client.DaprWorkflowClient;
+import io.dapr.workflows.client.WorkflowState;
+
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -20,37 +20,31 @@ import org.springframework.web.bind.annotation.*;
 @RestController
 @RequestMapping("/foreclosure")
 public class ForeclosureController {
-    private final WorkflowClient workflowClient;
+    private final DaprWorkflowClient workflowClient;
     private final PendingApprovalStore pendingApprovalStore;
-    private final ActivityCompletionClient completionClient;
 
-    public ForeclosureController(WorkflowClient workflowClient, PendingApprovalStore pendingApprovalStore) {
+    public ForeclosureController(DaprWorkflowClient workflowClient, PendingApprovalStore pendingApprovalStore) {
         this.workflowClient = workflowClient;
         this.pendingApprovalStore = pendingApprovalStore;
-        this.completionClient = workflowClient.newActivityCompletionClient();
     }
 
     /**
-     * ONLINE ASYNC API. The customer submits online; this endpoint starts Temporal
-     * and returns HTTP 202 immediately. It does NOT wait for a business decision.
-     * The workflow later sends the decision/settlement through notifyCustomer().
+     * ONLINE ASYNC API.
      */
     @PostMapping("/loans/{loanId}/start")
     public ResponseEntity<Map<String, String>> startOnline(@PathVariable String loanId, @RequestParam String customerId, @RequestParam(required = false) String requestId) {
         String id = (requestId == null || requestId.isBlank()) ? "FR-" + UUID.randomUUID() : requestId;
         ForeclosureRequest request = new ForeclosureRequest(id, loanId, customerId, Instant.now().toEpochMilli(), "ONLINE", "SIGNAL_WAIT");
         String workflowId = "foreclosure-" + id;
-        ForeclosureWorkflow workflow = newWorkflow(workflowId);
-        WorkflowClient.start(workflow::process, request);
+
+        workflowClient.scheduleNewWorkflow(ForeclosureWorkflow.class, request, workflowId);
+
         return ResponseEntity.accepted().body(Map.of("workflowId", workflowId, "requestId", id, "channel", "ONLINE", "status", "RECEIVED",
             "message", "Request received. Decision and settlement details will be communicated later."));
     }
 
     /**
-     * IN-BRANCH SYNCHRONOUS API. A representative uses this while the customer
-     * is present. It waits for the short synchronous Activity and returns the
-     * immediate eligibility decision plus settlement quote in the HTTP response.
-     * The 15-second wait is an API safety bound, not the bank approval window.
+     * IN-BRANCH SYNCHRONOUS API.
      */
     @PostMapping("/branch/loans/{loanId}/decision")
     public ResponseEntity<?> branchDecision(
@@ -60,16 +54,19 @@ public class ForeclosureController {
         String id = (requestId == null || requestId.isBlank()) ? "FR-" + UUID.randomUUID() : requestId;
         String workflowId = "foreclosure-" + id;
         ForeclosureRequest request = new ForeclosureRequest(id, loanId, customerId, Instant.now().toEpochMilli(), "BRANCH","SYNC");
+
         try {
-            ForeclosureWorkflow workflow = newWorkflow(workflowId);
-            WorkflowClient.start(workflow::process, request);
-            // getResult blocks this REST request until the branch workflow returns.
-            // Workflow execution itself remains durable and is not tied to this thread.
-            ForeclosureResult result = WorkflowStub.fromTyped(workflow)
-                .getResult(15, TimeUnit.SECONDS, ForeclosureResult.class);
-            return ResponseEntity.ok(result);
+            workflowClient.scheduleNewWorkflow(ForeclosureWorkflow.class, request, workflowId);
+            // Wait for up to 15 seconds
+            WorkflowState state = workflowClient.waitForWorkflowCompletion(workflowId, Duration.ofSeconds(15), true);
+            if (state != null && state.getRuntimeStatus().name().equals("COMPLETED")) {
+                return ResponseEntity.ok(state.readOutputAs(ForeclosureResult.class));
+            }
+            return ResponseEntity.status(HttpStatus.PROCESSING).body(Map.of(
+                "requestId", id, "workflowId", workflowId, "status", state != null ? state.getRuntimeStatus().name() : "PROCESSING",
+                "message", "The workflow completed with a non-success status."
+            ));
         } catch (TimeoutException e) {
-            // The caller can query status/result by requestId; do not start a duplicate workflow.
             return ResponseEntity.status(HttpStatus.GATEWAY_TIMEOUT).body(Map.of(
                 "requestId", id, "workflowId", workflowId, "status", "PROCESSING",
                 "message", "The immediate decision is taking longer than expected. Check the workflow status."));
@@ -80,19 +77,8 @@ public class ForeclosureController {
         }
     }
 
-    private ForeclosureWorkflow newWorkflow(String workflowId) {
-        return workflowClient.newWorkflowStub(ForeclosureWorkflow.class,
-            WorkflowOptions.newBuilder()
-                .setTaskQueue("foreclosure-queue")
-                .setWorkflowId(workflowId)
-                .build());
-    }
-
     /**
-     * BANK CALLBACK API. The authorized bank approval system posts APPROVED or
-     * REJECTED. ActivityCompletionClient completes the pending async Activity,
-     * which allows Temporal to resume the online workflow. Protect this endpoint
-     * with authentication/authorization before any production use.
+     * BANK CALLBACK API.
      */
     @PostMapping("/approvals/{approvalId}")
     public ResponseEntity<Map<String, String>> submitBankDecision(
@@ -109,56 +95,51 @@ public class ForeclosureController {
         if (decision == ForeclosureDecision.Decision.TIMED_OUT) {
             return ResponseEntity.badRequest().body(Map.of("error", "TIMED_OUT is system-managed"));
         }
+
         Optional<byte[]> tokenResult = pendingApprovalStore.getPendingToken(approvalId);
         if (tokenResult.isEmpty()) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of(
                 "error", "No pending approval found. It may have timed out or already been completed."));
         }
-        byte[] taskToken = tokenResult.get();
+        byte[] workflowInstanceIdBytes = tokenResult.get();
+        String workflowInstanceId = new String(workflowInstanceIdBytes);
+
         ForeclosureDecision result = new ForeclosureDecision(approvalId, decision, submission.comment(), Instant.now().toEpochMilli());
+
         try {
-            completionClient.complete(taskToken, result);
+            workflowClient.raiseEvent(workflowInstanceId, "bankApprovalCallback", result);
             pendingApprovalStore.markCompleted(approvalId);
+
             return ResponseEntity.accepted().body(Map.of(
                 "approvalId", approvalId, "decision", decision.name(), "status", "DECISION_SUBMITTED",
-                "message", "Temporal has been notified of the bank decision."));
+                "message", "Dapr has been notified of the bank decision via external event."));
         } catch (RuntimeException e) {
-            // Intentionally do not log exception details: provider exceptions may include sensitive context.
             return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
-                "error", "Could not complete the pending Temporal Activity. Check whether it timed out."));
+                "error", "Could not raise event on Dapr workflow. Check whether it timed out."));
         } finally {
-            java.util.Arrays.fill(taskToken, (byte) 0);
+            java.util.Arrays.fill(workflowInstanceIdBytes, (byte) 0);
         }
     }
 
-    /** Signal API for a follow-up event on an already-running workflow; Signal itself returns no business decision. */
+    /** Signal API */
     @PostMapping("/signal")
     public ResponseEntity<Map<String, String>> signalBankDecision(
             @RequestBody ForeclosureDecisionSignal signal) {
 
-        if (signal == null
-                || signal.requestId() == null
-                || signal.loanId() == null
-                || signal.decision() == null) {
-            return ResponseEntity.badRequest().body(Map.of(
-                    "error", "requestId, loanId and decision are required"));
+        if (signal == null || signal.requestId() == null || signal.loanId() == null || signal.decision() == null) {
+            return ResponseEntity.badRequest().body(Map.of("error", "requestId, loanId and decision are required"));
         }
 
         String decision = signal.decision().trim().toUpperCase();
 
         if (!decision.equals("APPROVED") && !decision.equals("REJECTED")) {
-            return ResponseEntity.badRequest().body(Map.of(
-                    "error", "decision must be APPROVED or REJECTED"));
+            return ResponseEntity.badRequest().body(Map.of("error", "decision must be APPROVED or REJECTED"));
         }
 
         String workflowId = "foreclosure-" + signal.requestId();
 
         try {
-            ForeclosureWorkflow workflow =
-                    workflowClient.newWorkflowStub(
-                            ForeclosureWorkflow.class, workflowId);
-
-            workflow.submitBankDecision(signal);
+            workflowClient.raiseEvent(workflowId, "submitBankDecision", signal);
 
             return ResponseEntity.accepted().body(Map.of(
                     "workflowId", workflowId,
@@ -176,17 +157,25 @@ public class ForeclosureController {
         }
     }
 
-    /** Query workflow state; this is not the same as waiting synchronously for the result. */
+    /** Query workflow state */
     @GetMapping("/loans/{loanId}/status")
     public ResponseEntity<Map<String, String>> status(@PathVariable String loanId, @RequestParam String requestId) {
         try {
-            ForeclosureWorkflow workflow = workflowClient.newWorkflowStub(ForeclosureWorkflow.class, "foreclosure-" + requestId);
-            return ResponseEntity.ok(Map.of("requestId", requestId, "loanId", loanId, "status", workflow.getStatus()));
+            String workflowId = "foreclosure-" + requestId;
+            WorkflowState status = workflowClient.getWorkflowState(workflowId, true);
+            if (status == null) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Workflow not found"));
+            }
+
+            // WorkflowState does not expose custom status directly via getter in this version,
+            // fallback to readOutputAs or getRuntimeStatus().
+            String customStatus = status.getRuntimeStatus().name();
+
+            return ResponseEntity.ok(Map.of("requestId", requestId, "loanId", loanId, "status", customStatus));
         } catch (RuntimeException e) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Workflow not found"));
         }
     }
-
 
    //async-activity processing
     @PostMapping("/async-activity/loans/{loanId}/start")
@@ -195,27 +184,13 @@ public class ForeclosureController {
             @RequestParam String customerId) {
 
         String requestId = "FR-" + UUID.randomUUID();
-        String workflowId = "foreclosure-async-" + requestId;
+        String workflowId = "foreclosure-" + requestId;
 
         ForeclosureRequest request = new ForeclosureRequest(
-                requestId,
-                loanId,
-                customerId,
-                Instant.now().toEpochMilli(),
-                "ONLINE",
-                "ASYNC_ACTIVITY_COMPLETION"
+                requestId, loanId, customerId, Instant.now().toEpochMilli(), "ONLINE", "ASYNC_ACTIVITY_COMPLETION"
         );
 
-        ForeclosureWorkflow workflow =
-                workflowClient.newWorkflowStub(
-                        ForeclosureWorkflow.class,
-                        WorkflowOptions.newBuilder()
-                                .setWorkflowId(workflowId)
-                                .setTaskQueue("foreclosure-queue")
-                                .build()
-                );
-
-        WorkflowClient.start(workflow::process, request);
+        workflowClient.scheduleNewWorkflow(ForeclosureWorkflow.class, request, workflowId);
 
         return ResponseEntity.accepted().body(Map.of(
                 "requestId", requestId,

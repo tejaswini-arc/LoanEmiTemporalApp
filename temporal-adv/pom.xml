@@ -36,8 +36,8 @@
 		</dependency>
 
         <dependency>
-            <groupId>com.mysql</groupId>
-            <artifactId>mysql-connector-j</artifactId>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
             <scope>runtime</scope>
         </dependency>
 
@@ -52,9 +52,14 @@
         </dependency>
 
 		<dependency>
-			<groupId>io.temporal</groupId>
-			<artifactId>temporal-spring-boot-starter</artifactId>
-			<version>1.31.0</version>
+			<groupId>io.dapr</groupId>
+			<artifactId>dapr-sdk-workflows</artifactId>
+			<version>1.17.4</version>
+		</dependency>
+		<dependency>
+			<groupId>io.dapr</groupId>
+			<artifactId>dapr-sdk-springboot</artifactId>
+			<version>1.17.4</version>
 		</dependency>
 		<dependency>
 			<groupId>org.projectlombok</groupId>
